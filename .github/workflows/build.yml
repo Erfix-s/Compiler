@@ -83,7 +83,7 @@ jobs:
           gradle-version: "9.6.1"
           cache-cleanup: on-success
 
-      - name: Install Android SDK Platform 37 and build tools
+      - name: Install Android SDK Platform 37 and Build Tools 37
         shell: bash
         run: |
           set -euo pipefail
@@ -103,19 +103,33 @@ jobs:
           fi
 
           set +o pipefail
-          yes | "$SDKMANAGER" --licenses >/dev/null
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
           set -o pipefail
-          "$SDKMANAGER" --install \
-            "platforms;android-37" \
-            "build-tools;36.0.0" \
+
+          # Android 17 API 37 is published under android-37.0, not android-37.
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --channel=3 --install \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0" \
             "platform-tools" \
             "ndk;28.2.13676358"
 
+          # AGP looks for platforms/android-37 when compileSdk is set to 37.
+          # Add a compatibility alias to the installed android-37.0 directory.
+          if [ -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -e "$SDK_ROOT/platforms/android-37" ]; then
+            ln -s android-37.0 "$SDK_ROOT/platforms/android-37"
+          fi
+
+          test -f "$SDK_ROOT/platforms/android-37/android.jar" || {
+            echo "::error::Android API 37 platform files were not installed correctly."
+            ls -la "$SDK_ROOT/platforms" || true
+            exit 1
+          }
+          test -x "$SDK_ROOT/build-tools/37.0.0/zipalign"
+          test -x "$SDK_ROOT/build-tools/37.0.0/apksigner"
+
           java --version
           python --version
-          test -x "$SDK_ROOT/build-tools/36.0.0/zipalign"
-          test -x "$SDK_ROOT/build-tools/36.0.0/apksigner"
-          "$SDK_ROOT/build-tools/36.0.0/apksigner" version
+          "$SDK_ROOT/build-tools/37.0.0/apksigner" version
 
       - name: Build unsigned release APK
         working-directory: app-src
@@ -135,7 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          BUILD_TOOLS="$SDK_ROOT/build-tools/36.0.0"
+          BUILD_TOOLS="$SDK_ROOT/build-tools/37.0.0"
           UNSIGNED_APK="$(find app-src/app/build/outputs/apk/release -maxdepth 1 -type f -name '*unsigned*.apk' -print -quit)"
           if [ -z "$UNSIGNED_APK" ]; then
             echo "::error::No unsigned release APK was produced."
