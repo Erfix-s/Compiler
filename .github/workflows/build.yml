@@ -1,0 +1,141 @@
+name: Build and release PyStudio
+
+on:
+  push:
+    paths:
+      - "PyStudio-Android.zip"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pystudio-release-${{ github.run_number }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate and unpack Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f PyStudio-Android.zip || { echo "::error::PyStudio-Android.zip is missing from repository root."; exit 1; }
+          unzip -tq PyStudio-Android.zip
+          rm -rf app-src release
+          mkdir -p app-src release
+          unzip -q PyStudio-Android.zip -d app-src
+
+          test -f app-src/settings.gradle.kts || { echo "::error::settings.gradle.kts is missing at ZIP root."; exit 1; }
+          test -f app-src/app/build.gradle.kts || { echo "::error::app/build.gradle.kts is missing at ZIP root."; exit 1; }
+          test -f app-src/pystudio.keystore || { echo "::error::pystudio.keystore is missing from ZIP."; exit 1; }
+          grep -Fq 'com.google.android.material:material:1.14.0' app-src/app/build.gradle.kts || {
+            echo "::error::The app is missing Material Components 1.14.0, required by Theme.Material3 resources. Update PyStudio-Android.zip.";
+            exit 1;
+          }
+          echo "Android project ZIP validated."
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Python 3.10 for Chaquopy
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            echo "::error::ANDROID_SDK_ROOT / ANDROID_HOME is not set on this runner."
+            exit 1
+          fi
+
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::Android sdkmanager was not found."
+            exit 1
+          fi
+
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          set -o pipefail
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          java --version
+          python --version
+
+      - name: Set up Gradle 8.14
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.14"
+          cache-cleanup: on-success
+
+      - name: Build signed release APK
+        working-directory: app-src
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace --warning-mode all clean assembleRelease
+
+      - name: Package APK and checksum
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="1.0.${GITHUB_RUN_NUMBER}"
+          APK="$(find app-src/app/build/outputs/apk/release -type f -name '*.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "::error::No release APK was produced."
+            exit 1
+          fi
+          cp "$APK" "release/PyStudio-v${VERSION}.apk"
+          (cd release && sha256sum *.apk > SHA256SUMS.txt)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          ls -lh release
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: PyStudio-v${{ steps.package.outputs.version }}
+          path: |
+            release/*.apk
+            release/*.txt
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.package.outputs.version }}
+          name: PyStudio v${{ steps.package.outputs.version }}
+          body: |
+            PyStudio — Python editor / compiler for Android.
+
+            * Version: **v${{ steps.package.outputs.version }}** (build `${{ github.run_number }}`)
+            * Signed with the fixed keystore shipped inside `PyStudio-Android.zip`
+            * `applicationId` is unchanged, so this APK installs directly over the previous one — no uninstall needed.
+            * Bundled Python 3.10 with NumPy, OpenCV (`cv2`), Matplotlib and Pillow.
+
+            Install `PyStudio-v${{ steps.package.outputs.version }}.apk`, then check `SHA256SUMS.txt` for the checksum.
+          files: |
+            release/*.apk
+            release/*.txt
+          fail_on_unmatched_files: true
+          make_latest: true
