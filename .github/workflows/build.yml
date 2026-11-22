@@ -11,19 +11,19 @@ permissions:
   contents: write
 
 concurrency:
-  group: pystudio-release-${{ github.run_number }}
+  group: pystudio-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build-and-release:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Validate and unpack Android project
+      - name: Validate project ZIP and signing key
         shell: bash
         run: |
           set -euo pipefail
@@ -33,27 +33,57 @@ jobs:
           mkdir -p app-src release
           unzip -q PyStudio-Android.zip -d app-src
 
-          test -f app-src/settings.gradle.kts || { echo "::error::settings.gradle.kts is missing at ZIP root."; exit 1; }
-          test -f app-src/app/build.gradle.kts || { echo "::error::app/build.gradle.kts is missing at ZIP root."; exit 1; }
-          test -f app-src/pystudio.keystore || { echo "::error::pystudio.keystore is missing from ZIP."; exit 1; }
-          grep -Fq 'com.google.android.material:material:1.14.0' app-src/app/build.gradle.kts || {
-            echo "::error::The app is missing Material Components 1.14.0, required by Theme.Material3 resources. Update PyStudio-Android.zip.";
-            exit 1;
-          }
-          echo "Android project ZIP validated."
+          test -f app-src/settings.gradle || { echo "::error::settings.gradle is missing."; exit 1; }
+          test -f app-src/build.gradle || { echo "::error::Root build.gradle is missing."; exit 1; }
+          test -f app-src/app/build.gradle || { echo "::error::app/build.gradle is missing."; exit 1; }
+          test -f app-src/app/src/main/AndroidManifest.xml || { echo "::error::AndroidManifest.xml is missing."; exit 1; }
+          test -f app-src/signing/release.pk8 || { echo "::error::Signing private key is missing."; exit 1; }
+          test -f app-src/signing/release.cert.pem || { echo "::error::Signing certificate is missing."; exit 1; }
 
-      - name: Set up JDK 21 (Temurin)
+          grep -Fq 'id "com.android.application" version "9.4.0" apply false' app-src/build.gradle || {
+            echo "::error::Unexpected Android Gradle Plugin version."; exit 1;
+          }
+          grep -Fq 'id "com.chaquo.python" version "17.2.0" apply false' app-src/build.gradle || {
+            echo "::error::Unexpected Chaquopy version."; exit 1;
+          }
+          grep -Fq 'compileSdk = 37' app-src/app/build.gradle || {
+            echo "::error::The project must compile against Android API 37."; exit 1;
+          }
+          grep -Fq 'com.google.android.material:material:1.12.0' app-src/app/build.gradle || {
+            echo "::error::The Material Components dependency is missing."; exit 1;
+          }
+          grep -Fq 'Theme.Material3.Dark.NoActionBar' app-src/app/src/main/res/values/themes.xml || {
+            echo "::error::The expected Material 3 app theme was not found."; exit 1;
+          }
+          grep -Fq 'applicationId "com.pystudio.ide"' app-src/app/build.gradle || {
+            echo "::error::The applicationId does not match the existing PyStudio app."; exit 1;
+          }
+
+          openssl pkey -inform DER -in app-src/signing/release.pk8 -pubout -out "$RUNNER_TEMP/pystudio-key.pub"
+          openssl x509 -in app-src/signing/release.cert.pem -pubkey -noout -out "$RUNNER_TEMP/pystudio-cert.pub"
+          diff -u "$RUNNER_TEMP/pystudio-key.pub" "$RUNNER_TEMP/pystudio-cert.pub" || {
+            echo "::error::The private key and signing certificate do not match."; exit 1;
+          }
+          echo "Project ZIP and signing key validated."
+
+      - name: Set up JDK 17 (Temurin)
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "17"
 
       - name: Set up Python 3.10 for Chaquopy
         uses: actions/setup-python@v7
         with:
           python-version: "3.10"
 
-      - name: Install Android SDK 36
+      - name: Set up Gradle 9.6.1
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "9.6.1"
+          cache-cleanup: on-success
+
+      - name: Install Android SDK Platform 37 and build tools
         shell: bash
         run: |
           set -euo pipefail
@@ -65,7 +95,7 @@ jobs:
 
           SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(command -v sdkmanager || true)"
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
           fi
           if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
             echo "::error::Android sdkmanager was not found."
@@ -75,42 +105,61 @@ jobs:
           set +o pipefail
           yes | "$SDKMANAGER" --licenses >/dev/null
           set -o pipefail
-          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          "$SDKMANAGER" --install \
+            "platforms;android-37" \
+            "build-tools;36.0.0" \
+            "platform-tools" \
+            "ndk;28.2.13676358"
+
           java --version
           python --version
+          test -x "$SDK_ROOT/build-tools/36.0.0/zipalign"
+          test -x "$SDK_ROOT/build-tools/36.0.0/apksigner"
+          "$SDK_ROOT/build-tools/36.0.0/apksigner" version
 
-      - name: Set up Gradle 8.14
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: "8.14"
-          cache-cleanup: on-success
-
-      - name: Build signed release APK
+      - name: Build unsigned release APK
         working-directory: app-src
         env:
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 2.0.${{ github.run_number }}
         shell: bash
         run: |
           set -euo pipefail
           gradle --no-daemon --stacktrace --warning-mode all clean assembleRelease
 
-      - name: Package APK and checksum
+      - name: Align, sign, and verify APK
         id: package
         shell: bash
+        env:
+          VERSION_NAME: 2.0.${{ github.run_number }}
         run: |
           set -euo pipefail
-          VERSION="1.0.${GITHUB_RUN_NUMBER}"
-          APK="$(find app-src/app/build/outputs/apk/release -type f -name '*.apk' -print -quit)"
-          if [ -z "$APK" ]; then
-            echo "::error::No release APK was produced."
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          BUILD_TOOLS="$SDK_ROOT/build-tools/36.0.0"
+          UNSIGNED_APK="$(find app-src/app/build/outputs/apk/release -maxdepth 1 -type f -name '*unsigned*.apk' -print -quit)"
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "::error::No unsigned release APK was produced."
+            find app-src/app/build/outputs -type f -name '*.apk' -print || true
             exit 1
           fi
-          cp "$APK" "release/PyStudio-v${VERSION}.apk"
+
+          ALIGNED_APK="$RUNNER_TEMP/PyStudio-aligned.apk"
+          OUTPUT_APK="release/PyStudio-v${VERSION_NAME}.apk"
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+          "$BUILD_TOOLS/apksigner" sign \
+            --key app-src/signing/release.pk8 \
+            --cert app-src/signing/release.cert.pem \
+            --min-sdk-version 26 \
+            --out "$OUTPUT_APK" \
+            "$ALIGNED_APK"
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$OUTPUT_APK"
+          rm -f "$ALIGNED_APK"
+
           (cd release && sha256sum *.apk > SHA256SUMS.txt)
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
           ls -lh release
 
-      - name: Upload build artifact
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
           name: PyStudio-v${{ steps.package.outputs.version }}
@@ -129,11 +178,11 @@ jobs:
             PyStudio — Python editor / compiler for Android.
 
             * Version: **v${{ steps.package.outputs.version }}** (build `${{ github.run_number }}`)
-            * Signed with the fixed keystore shipped inside `PyStudio-Android.zip`
-            * `applicationId` is unchanged, so this APK installs directly over the previous one — no uninstall needed.
-            * Bundled Python 3.10 with NumPy, OpenCV (`cv2`), Matplotlib and Pillow.
+            * Signed with the matching release key and certificate included in the project ZIP.
+            * `applicationId` remains `com.pystudio.ide`.
+            * Includes Python 3.10 with NumPy, OpenCV (`cv2`), Matplotlib, Pillow, requests and BeautifulSoup.
 
-            Install `PyStudio-v${{ steps.package.outputs.version }}.apk`, then check `SHA256SUMS.txt` for the checksum.
+            Install `PyStudio-v${{ steps.package.outputs.version }}.apk`. See `SHA256SUMS.txt` for its SHA-256 checksum.
           files: |
             release/*.apk
             release/*.txt
